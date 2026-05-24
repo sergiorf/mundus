@@ -13,6 +13,14 @@ pub enum TerrainType {
 }
 
 impl TerrainType {
+    pub const fn is_water(self) -> bool {
+        matches!(self, Self::Water)
+    }
+
+    pub const fn is_land(self) -> bool {
+        !self.is_water()
+    }
+
     pub const fn base_yield(self) -> ResourceYield {
         match self {
             Self::Plains => ResourceYield::new(2, 1, 0, 0),

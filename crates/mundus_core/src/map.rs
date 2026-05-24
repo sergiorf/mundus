@@ -12,6 +12,14 @@ pub struct Map {
 }
 
 impl Map {
+    pub fn filled(width: usize, height: usize, terrain: TerrainType) -> Self {
+        Self {
+            width,
+            height,
+            tiles: vec![Tile::new(terrain); width * height],
+        }
+    }
+
     pub fn generate(width: usize, height: usize, seed: u64) -> Self {
         let mut rng = SeededRng::new(seed);
         let mut tiles = Vec::with_capacity(width * height);

@@ -21,9 +21,35 @@ direction. The assets are intentionally simple and readable at small sizes.
 - `city.svg`
 - `capital.svg`
 - `mine.svg`
+- `farmland.svg`
+- `plantation.svg`
+- `pasture.svg`
+- `village.svg`
+- `house.svg`
+- `warehouse.svg`
+- `market.svg`
+- `port.svg`
+- `bridge.svg`
+- `road.svg`
+- `wall.svg`
+- `fort.svg`
+- `ship_sloop.svg`
+- `ship_frigate.svg`
+- `wheat.svg`
+- `timber.svg`
+- `fish.svg`
+- `wool.svg`
+- `cloth.svg`
+- `sugar.svg`
+- `tobacco.svg`
+- `spice.svg`
+- `gold_goods.svg`
+- `silver_goods.svg`
 
 ## Notes
 
 - These files are local project placeholders, not third-party imports.
 - Prefer using stable local filenames from this directory in any asset lookup
   layer so they can be replaced later without touching game logic.
+- The visual target is a readable 18th-century-inspired strategy map rather than
+  final production art.

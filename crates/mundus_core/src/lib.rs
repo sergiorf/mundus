@@ -27,4 +27,4 @@ pub use player::Player;
 pub use resources::{ResourceStockpile, ResourceYield};
 pub use terrain::TerrainType;
 pub use unit::{Unit, UnitKind};
-pub use world::World;
+pub use world::{World, WorldConfig, WorldPreset};

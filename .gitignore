@@ -1,2 +1,6 @@
 /target
 /.codex
+/tools/earth_pipeline/cache/
+/assets/earth/raw/
+/assets/earth/sim/
+/assets/earth/render/

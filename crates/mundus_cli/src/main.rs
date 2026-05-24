@@ -1,9 +1,40 @@
+use macroquad::prelude::*;
 use mundus_core::{
-    CityProjectKind, Game, GameConfig, GameOutcome, PlayerAction, TerrainType, TilePosition,
+    CityProjectKind, Game, GameConfig, GameOutcome, PlayerAction, TerrainType, TilePosition, World,
+    WorldConfig, WorldPreset,
 };
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
-fn main() {
+const WORLD_MAP_WIDTH: usize = 120;
+const WORLD_MAP_HEIGHT: usize = 80;
+const BASE_TILE_SIZE: f32 = 48.0;
+const MIN_ZOOM: f32 = 0.18;
+const MAX_ZOOM: f32 = 9.0;
+const ZOOM_STEP: f32 = 0.2;
+const EARTH_LOD0_MANIFEST: &str = "assets/earth/render/lod0/manifest.toml";
+
+fn window_conf() -> Conf {
+    Conf {
+        window_title: "Mundus Terrain Viewer".to_string(),
+        window_width: 1440,
+        window_height: 900,
+        high_dpi: true,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(window_conf)]
+async fn main() {
+    if std::env::args().any(|arg| arg == "--cli") {
+        run_cli();
+        return;
+    }
+
+    run_gui().await;
+}
+
+fn run_cli() {
     let mut game = Game::new(GameConfig::default());
     println!("Mundus CLI prototype");
     println!("Type 'help' to see commands.");
@@ -40,6 +71,371 @@ fn main() {
             Err(error) => eprintln!("{error}"),
         }
     }
+}
+
+async fn run_gui() {
+    let mut viewer = TerrainViewer::new(1).await;
+
+    loop {
+        viewer.update();
+        viewer.draw();
+        next_frame().await;
+    }
+}
+
+struct TerrainViewer {
+    world: World,
+    seed: u64,
+    camera: ViewerCamera,
+    earth_lod0: Option<EarthLod0Layer>,
+}
+
+struct ViewerCamera {
+    tiles: Vec2,
+    zoom: f32,
+    drag_last_mouse: Option<Vec2>,
+}
+
+struct EarthLod0Layer {
+    tiles_x: u32,
+    tiles_y: u32,
+    tiles: Vec<EarthTextureTile>,
+}
+
+struct EarthTextureTile {
+    x: u32,
+    y: u32,
+    texture: Texture2D,
+}
+
+impl TerrainViewer {
+    async fn new(seed: u64) -> Self {
+        Self {
+            world: build_world(seed),
+            seed,
+            camera: ViewerCamera {
+                tiles: vec2(0.0, 0.0),
+                zoom: 1.0,
+                drag_last_mouse: None,
+            },
+            earth_lod0: load_earth_lod0().await,
+        }
+    }
+
+    fn update(&mut self) {
+        self.handle_zoom();
+        self.handle_keyboard_pan();
+        self.handle_mouse_pan();
+
+        if is_key_pressed(KeyCode::R) {
+            self.seed += 1;
+            self.world = build_world(self.seed);
+        }
+
+        self.clamp_camera();
+    }
+
+    fn handle_zoom(&mut self) {
+        let (_, wheel_y) = mouse_wheel();
+        if wheel_y.abs() > f32::EPSILON {
+            let old_zoom = self.camera.zoom;
+            self.camera.zoom = (self.camera.zoom + wheel_y * ZOOM_STEP).clamp(MIN_ZOOM, MAX_ZOOM);
+            if (self.camera.zoom - old_zoom).abs() > f32::EPSILON {
+                let mouse = vec2(mouse_position().0, mouse_position().1);
+                let world_before = self.screen_to_world_tiles(mouse, old_zoom);
+                let world_after = self.screen_to_world_tiles(mouse, self.camera.zoom);
+                self.camera.tiles += world_before - world_after;
+            }
+        }
+    }
+
+    fn handle_keyboard_pan(&mut self) {
+        let frame_pan = 28.0 * get_frame_time() / self.camera.zoom.max(0.2);
+        if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
+            self.camera.tiles.x -= frame_pan;
+        }
+        if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
+            self.camera.tiles.x += frame_pan;
+        }
+        if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) {
+            self.camera.tiles.y -= frame_pan;
+        }
+        if is_key_down(KeyCode::S) || is_key_down(KeyCode::Down) {
+            self.camera.tiles.y += frame_pan;
+        }
+    }
+
+    fn handle_mouse_pan(&mut self) {
+        let mouse = vec2(mouse_position().0, mouse_position().1);
+        let is_dragging =
+            is_mouse_button_down(MouseButton::Middle) || is_mouse_button_down(MouseButton::Right);
+
+        if is_dragging {
+            if let Some(last_mouse) = self.camera.drag_last_mouse {
+                let tile_size = self.tile_size();
+                let delta = (mouse - last_mouse) / tile_size;
+                self.camera.tiles -= delta;
+            }
+            self.camera.drag_last_mouse = Some(mouse);
+        } else {
+            self.camera.drag_last_mouse = None;
+        }
+    }
+
+    fn draw(&self) {
+        clear_background(Color::from_rgba(9, 14, 24, 255));
+
+        let tile_size = self.tile_size();
+        let hovered = self.hovered_tile();
+
+        self.draw_earth_background();
+
+        for y in 0..self.world.map.height {
+            for x in 0..self.world.map.width {
+                let position = TilePosition::new(x, y);
+                let screen = self.tile_to_screen(position);
+
+                if screen.x > screen_width()
+                    || screen.y > screen_height()
+                    || screen.x + tile_size < 0.0
+                    || screen.y + tile_size < 0.0
+                {
+                    continue;
+                }
+
+                draw_rectangle_lines(
+                    screen.x,
+                    screen.y,
+                    tile_size,
+                    tile_size,
+                    1.0,
+                    Color::from_rgba(255, 255, 255, 24),
+                );
+            }
+        }
+
+        if let Some(position) = hovered {
+            let screen = self.tile_to_screen(position);
+            draw_rectangle_lines(
+                screen.x + 2.0,
+                screen.y + 2.0,
+                tile_size - 4.0,
+                tile_size - 4.0,
+                3.0,
+                GOLD,
+            );
+        }
+
+        self.draw_hud(hovered);
+    }
+
+    fn draw_earth_background(&self) {
+        let Some(layer) = &self.earth_lod0 else {
+            return;
+        };
+
+        let tile_world_width = self.world.map.width as f32 / layer.tiles_x as f32;
+        let tile_world_height = self.world.map.height as f32 / layer.tiles_y as f32;
+        let tile_size = self.tile_size();
+
+        for tile in &layer.tiles {
+            let world_x = tile.x as f32 * tile_world_width;
+            let world_y = tile.y as f32 * tile_world_height;
+            let screen = vec2(
+                (world_x - self.camera.tiles.x) * tile_size,
+                (world_y - self.camera.tiles.y) * tile_size,
+            );
+            let dest_size = vec2(tile_world_width * tile_size, tile_world_height * tile_size);
+
+            if screen.x > screen_width()
+                || screen.y > screen_height()
+                || screen.x + dest_size.x < 0.0
+                || screen.y + dest_size.y < 0.0
+            {
+                continue;
+            }
+
+            draw_texture_ex(
+                &tile.texture,
+                screen.x,
+                screen.y,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(dest_size),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    fn draw_hud(&self, hovered: Option<TilePosition>) {
+        draw_rectangle(16.0, 16.0, 430.0, 116.0, Color::from_rgba(11, 19, 30, 220));
+        draw_text("Mundus Terrain Viewer", 28.0, 44.0, 32.0, WHITE);
+        draw_text(
+            "Wheel: zoom  |  Right/Middle drag: pan  |  WASD/Arrows: move  |  R: regenerate",
+            28.0,
+            72.0,
+            20.0,
+            Color::from_rgba(206, 219, 230, 230),
+        );
+        draw_text(
+            &format!(
+                "preset=earth  seed={}  zoom={:.2}  map={}x{}  --cli: text mode",
+                self.seed, self.camera.zoom, self.world.map.width, self.world.map.height
+            ),
+            28.0,
+            100.0,
+            22.0,
+            Color::from_rgba(168, 189, 206, 230),
+        );
+
+        if let Some(position) = hovered {
+            if let Some(tile) = self.world.map.get(position) {
+                let info = format!(
+                    "tile=({}, {})  terrain={}  passable={}  yield=f{} p{} g{} k{}",
+                    position.x,
+                    position.y,
+                    terrain_name(&self.world, position),
+                    tile.terrain.is_passable(),
+                    tile.terrain.base_yield().food,
+                    tile.terrain.base_yield().production,
+                    tile.terrain.base_yield().gold,
+                    tile.terrain.base_yield().knowledge,
+                );
+                let width = measure_text(&info, None, 24, 1.0).width + 32.0;
+                let y = screen_height() - 54.0;
+                draw_rectangle(
+                    16.0,
+                    y - 30.0,
+                    width,
+                    42.0,
+                    Color::from_rgba(11, 19, 30, 220),
+                );
+                draw_text(&info, 28.0, y, 24.0, WHITE);
+            }
+        }
+    }
+
+    fn tile_size(&self) -> f32 {
+        BASE_TILE_SIZE * self.camera.zoom
+    }
+
+    fn tile_to_screen(&self, position: TilePosition) -> Vec2 {
+        let tile_size = self.tile_size();
+        vec2(
+            (position.x as f32 - self.camera.tiles.x) * tile_size,
+            (position.y as f32 - self.camera.tiles.y) * tile_size,
+        )
+    }
+
+    fn screen_to_world_tiles(&self, screen: Vec2, zoom: f32) -> Vec2 {
+        let tile_size = BASE_TILE_SIZE * zoom;
+        vec2(
+            self.camera.tiles.x + screen.x / tile_size,
+            self.camera.tiles.y + screen.y / tile_size,
+        )
+    }
+
+    fn hovered_tile(&self) -> Option<TilePosition> {
+        let mouse = vec2(mouse_position().0, mouse_position().1);
+        let world = self.screen_to_world_tiles(mouse, self.camera.zoom);
+        let x = world.x.floor() as isize;
+        let y = world.y.floor() as isize;
+        if x < 0 || y < 0 {
+            return None;
+        }
+        let position = TilePosition::new(x as usize, y as usize);
+        self.world.map.in_bounds(position).then_some(position)
+    }
+
+    fn clamp_camera(&mut self) {
+        let visible_tiles_x = screen_width() / self.tile_size();
+        let visible_tiles_y = screen_height() / self.tile_size();
+        let max_x = (self.world.map.width as f32 - visible_tiles_x).max(0.0);
+        let max_y = (self.world.map.height as f32 - visible_tiles_y).max(0.0);
+        self.camera.tiles.x = self.camera.tiles.x.clamp(0.0, max_x);
+        self.camera.tiles.y = self.camera.tiles.y.clamp(0.0, max_y);
+    }
+}
+
+fn build_world(seed: u64) -> World {
+    World::generate(
+        WorldConfig::new(WORLD_MAP_WIDTH, WORLD_MAP_HEIGHT, seed).with_preset(WorldPreset::Earth),
+    )
+}
+
+async fn load_earth_lod0() -> Option<EarthLod0Layer> {
+    let manifest_path = Path::new(EARTH_LOD0_MANIFEST);
+    let manifest = std::fs::read_to_string(manifest_path).ok()?;
+    let mut tiles_x = None;
+    let mut tiles_y = None;
+    let mut pending_x = None;
+    let mut pending_y = None;
+    let mut tiles = Vec::new();
+
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("tiles_x = ") {
+            tiles_x = value.parse::<u32>().ok();
+        } else if let Some(value) = trimmed.strip_prefix("tiles_y = ") {
+            tiles_y = value.parse::<u32>().ok();
+        } else if let Some(value) = trimmed.strip_prefix("x = ") {
+            pending_x = value.parse::<u32>().ok();
+        } else if let Some(value) = trimmed.strip_prefix("y = ") {
+            pending_y = value.parse::<u32>().ok();
+        } else if let Some(value) = trimmed.strip_prefix("path = ") {
+            let path = value.trim_matches('"');
+            let base_dir = manifest_path.parent()?;
+            let full_path: PathBuf = base_dir.join(path);
+            let texture = load_texture(full_path.to_str()?).await.ok()?;
+            texture.set_filter(FilterMode::Linear);
+            tiles.push(EarthTextureTile {
+                x: pending_x.take()?,
+                y: pending_y.take()?,
+                texture,
+            });
+        }
+    }
+
+    Some(EarthLod0Layer {
+        tiles_x: tiles_x?,
+        tiles_y: tiles_y?,
+        tiles,
+    })
+}
+
+fn terrain_name(world: &World, position: TilePosition) -> &'static str {
+    let terrain = world.map.get(position).expect("tile in bounds").terrain;
+    if is_coast_tile(world, position) {
+        return "Coast";
+    }
+
+    match terrain {
+        TerrainType::Plains => "Plains",
+        TerrainType::Forest => "Forest",
+        TerrainType::Hills => "Hills",
+        TerrainType::River => "River",
+        TerrainType::Mountain => "Mountain",
+        TerrainType::Water => "Water",
+        TerrainType::Desert => "Desert",
+    }
+}
+
+fn is_coast_tile(world: &World, position: TilePosition) -> bool {
+    let tile = world.map.get(position).expect("tile in bounds");
+    tile.terrain != TerrainType::Water
+        && world
+            .map
+            .neighbors8(position)
+            .into_iter()
+            .filter(|neighbor| *neighbor != position)
+            .any(|neighbor| {
+                world
+                    .map
+                    .get(neighbor)
+                    .map(|neighbor_tile| neighbor_tile.terrain == TerrainType::Water)
+                    .unwrap_or(false)
+            })
 }
 
 fn handle_command(game: &mut Game, command: &str) -> Result<bool, String> {
@@ -226,15 +622,7 @@ fn print_map(game: &Game) {
                 print!("{glyph}");
             } else {
                 let tile = game.state.world.map.get(position).unwrap();
-                let glyph = match tile.terrain {
-                    TerrainType::Plains => '.',
-                    TerrainType::Forest => 'F',
-                    TerrainType::Hills => 'H',
-                    TerrainType::River => 'R',
-                    TerrainType::Mountain => 'M',
-                    TerrainType::Water => 'W',
-                    TerrainType::Desert => 'D',
-                };
+                let glyph = tile.terrain.glyph();
                 print!("{glyph}");
             }
         }

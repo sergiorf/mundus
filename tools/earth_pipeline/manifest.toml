@@ -1,0 +1,84 @@
+version = 1
+
+[pipeline]
+name = "earth_pipeline"
+description = "Source inventory for the offline Earth asset pipeline."
+
+[[sources]]
+id = "natural_earth_110m_physical"
+required_for_phase = 4
+kind = "vector"
+provider = "Natural Earth"
+official_page = "https://www.naturalearthdata.com/downloads/110m-physical-vectors/"
+local_cache_dir = "tools/earth_pipeline/cache/natural_earth"
+recommended = true
+purpose = "Low-zoom land polygons, coastlines, ocean masks, rivers, and lakes."
+notes = "Minimum dataset for replacing the handcrafted Earth land shape."
+
+[[sources]]
+id = "natural_earth_50m_physical"
+required_for_phase = 7
+kind = "vector"
+provider = "Natural Earth"
+official_page = "https://www.naturalearthdata.com/downloads/50m-physical-vectors/"
+local_cache_dir = "tools/earth_pipeline/cache/natural_earth"
+recommended = true
+purpose = "Medium-zoom coastline and hydrography detail."
+notes = "Recommended once multiple render LODs are introduced."
+
+[[sources]]
+id = "natural_earth_10m_physical"
+required_for_phase = 7
+kind = "vector"
+provider = "Natural Earth"
+official_page = "https://www.naturalearthdata.com/downloads/10m-physical-vectors/"
+local_cache_dir = "tools/earth_pipeline/cache/natural_earth"
+recommended = true
+purpose = "High-zoom coastline and inland water detail."
+notes = "Used when close zoom needs better geometry than 50m."
+
+[[sources]]
+id = "nasa_blue_marble_next_generation"
+required_for_phase = 5
+kind = "raster"
+provider = "NASA"
+official_page = "https://science.nasa.gov/earth/earth-observatory/collections/blue-marble/"
+alternate_page = "https://visibleearth.nasa.gov/images/5935/blue-marble-next-generation"
+local_cache_dir = "tools/earth_pipeline/cache/blue_marble"
+recommended = true
+purpose = "Base true-color Earth imagery for low and medium zoom render tiles."
+notes = "Choose a global Blue Marble Next Generation image set that is practical for tile generation."
+
+[[sources]]
+id = "gebco_global_grid"
+required_for_phase = 6
+kind = "elevation"
+provider = "GEBCO"
+official_page = "https://www.gebco.net/data_and_products/gridded_bathymetry_data/"
+local_cache_dir = "tools/earth_pipeline/cache/gebco"
+recommended = true
+purpose = "Global elevation and bathymetry fallback for relief shading and ocean depth."
+notes = "Best first whole-world elevation source because it is already global."
+
+[[sources]]
+id = "usgs_srtm_1_arc_second_global"
+required_for_phase = 6
+kind = "elevation"
+provider = "USGS"
+official_page = "https://www.usgs.gov/centers/eros/science/usgs-eros-archive-digital-elevation-shuttle-radar-topography-mission-srtm-1-arc"
+local_cache_dir = "tools/earth_pipeline/cache/srtm"
+recommended = false
+purpose = "Higher-quality land elevation for mountain and relief refinement."
+notes = "Add after GEBCO. Access is operationally heavier and may require EarthExplorer workflow."
+
+[outputs]
+raw_dir = "assets/earth/raw"
+sim_dir = "assets/earth/sim"
+render_dir = "assets/earth/render"
+
+[first_milestone]
+required_sources = [
+  "natural_earth_110m_physical",
+  "nasa_blue_marble_next_generation",
+]
+goal = "Bake a real Earth land mask and one visual Earth render layer."

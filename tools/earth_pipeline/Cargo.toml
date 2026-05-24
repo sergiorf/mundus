@@ -1,0 +1,15 @@
+[package]
+name = "earth_pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+geo = "0.28"
+geo-types = "0.7"
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1.0", features = ["derive"] }
+shapefile = { version = "0.6", features = ["geo-types"] }
+tempfile = "3.10"
+toml = "0.8"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }

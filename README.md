@@ -2,12 +2,13 @@
 
 Mundus is a premium turn-based grand strategy prototype focused on a deterministic simulation core. The long-term goal is a reusable Rust foundation for compact strategy games covering economy, population, trade, logistics, war, diplomacy, AI civilizations, and procedural worlds.
 
-The current milestone is intentionally small: a CLI-playable prototype that proves the core turn loop is interesting, testable, and extensible.
+The current milestone is intentionally small: a deterministic core plus an early GUI terrain viewer and a CLI gameplay prototype.
 
 ## Current milestone
 
 - Deterministic simulation in `mundus_core`
-- Thin text interface in `mundus_cli`
+- GUI terrain viewer in `mundus_cli`
+- Text interface in `mundus_cli --cli`
 - One human civilization and one AI civilization
 - Grid map, cities, units, economy, combat, scoring, and win/loss rules
 - Unit tests for deterministic behavior and core rules
@@ -42,10 +43,23 @@ cargo build
 cargo test
 ```
 
-## Run the CLI
+## Run the Terrain Viewer
 
 ```bash
 cargo run -p mundus_cli
+```
+
+Viewer controls:
+
+- `Mouse wheel`: zoom
+- `Right` or `Middle mouse drag`: pan
+- `WASD` or arrow keys: pan
+- `R`: regenerate the terrain with the next seed
+
+## Run the CLI
+
+```bash
+cargo run -p mundus_cli -- --cli
 ```
 
 ## License
@@ -78,3 +92,13 @@ Useful commands in the CLI:
 2. Add save/load plus deterministic replay fixtures.
 3. Add more projects, city specialization, and a second unit line.
 4. Expand world generation and logistics without breaking core determinism.
+
+## Additional architecture docs
+
+- [Earth World Pipeline Plan](docs/architecture/earth_world_pipeline.md)
+
+## Earth pipeline scaffold
+
+- [Earth Pipeline README](tools/earth_pipeline/README.md)
+- [Earth Source Manifest](tools/earth_pipeline/manifest.toml)
+- `cargo run -p earth_pipeline -- verify`

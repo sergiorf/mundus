@@ -3,13 +3,12 @@ use crate::city::{City, CityProject, CityProjectKind};
 use crate::combat::{attack_city, attack_unit};
 use crate::error::GameError;
 use crate::ids::{CityId, PlayerId, TilePosition, TurnNumber, UnitId};
-use crate::map::Map;
 use crate::movement::move_unit;
 use crate::player::Player;
 use crate::resources::ResourceStockpile;
 use crate::turn::end_turn;
 use crate::unit::{Unit, UnitKind};
-use crate::world::World;
+use crate::world::{World, WorldConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,12 +138,39 @@ impl Game {
     pub fn new(config: GameConfig) -> Self {
         let human_player_id = PlayerId(1);
         let ai_player_id = PlayerId(2);
-        let world = World {
-            map: Map::generate(config.map_width, config.map_height, config.seed),
-        };
+        let mut world = World::generate(WorldConfig::new(
+            config.map_width,
+            config.map_height,
+            config.seed,
+        ));
 
-        let human_capital_position = TilePosition::new(1, 1);
-        let ai_capital_position = TilePosition::new(config.map_width - 2, config.map_height - 2);
+        let human_capital_position = TilePosition::new(
+            (config.map_width / 4).max(2),
+            (config.map_height / 2).saturating_sub(2).max(2),
+        );
+        let ai_capital_position = TilePosition::new(
+            (config.map_width * 3 / 4).min(config.map_width.saturating_sub(3)),
+            (config.map_height / 2 + 2).min(config.map_height.saturating_sub(3)),
+        );
+        let human_unit_position = TilePosition::new(
+            (human_capital_position.x + 1).min(config.map_width.saturating_sub(2)),
+            human_capital_position.y,
+        );
+        let ai_unit_position = TilePosition::new(
+            ai_capital_position.x.saturating_sub(1).max(1),
+            ai_capital_position.y,
+        );
+
+        for position in [
+            human_capital_position,
+            ai_capital_position,
+            human_unit_position,
+            ai_unit_position,
+        ] {
+            world
+                .map
+                .set_terrain(position, crate::terrain::TerrainType::Plains);
+        }
 
         let players = vec![
             Player {
@@ -197,14 +223,9 @@ impl Game {
                 UnitId(1),
                 human_player_id,
                 UnitKind::Militia,
-                TilePosition::new(2, 1),
+                human_unit_position,
             ),
-            Unit::new(
-                UnitId(2),
-                ai_player_id,
-                UnitKind::Militia,
-                TilePosition::new(config.map_width - 3, config.map_height - 2),
-            ),
+            Unit::new(UnitId(2), ai_player_id, UnitKind::Militia, ai_unit_position),
         ];
 
         Self {
@@ -321,15 +342,20 @@ mod tests {
     fn same_seed_and_same_actions_produce_same_result() {
         let mut left = Game::new_default(9);
         let mut right = Game::new_default(9);
+        let move_target = TilePosition::new(
+            (left.state.human_units()[0].position.x + 1)
+                .min(left.state.world.map.width.saturating_sub(2)),
+            left.state.human_units()[0].position.y,
+        );
         left.state
             .world
             .map
-            .set_terrain(TilePosition::new(3, 1), TerrainType::Plains);
+            .set_terrain(move_target, TerrainType::Plains);
         right
             .state
             .world
             .map
-            .set_terrain(TilePosition::new(3, 1), TerrainType::Plains);
+            .set_terrain(move_target, TerrainType::Plains);
         let unit_id = left.state.human_units()[0].id;
         let right_unit_id = right.state.human_units()[0].id;
         let city_id = left.state.human_cities()[0].id;
@@ -342,7 +368,7 @@ mod tests {
             },
             PlayerAction::MoveUnit {
                 unit_id,
-                to: TilePosition::new(3, 1),
+                to: move_target,
             },
             PlayerAction::EndTurn,
         ];

@@ -5,5 +5,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+macroquad = "0.4"
 mundus_core = { path = "../mundus_core" }
-
