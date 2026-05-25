@@ -19,7 +19,7 @@ pub fn collect_city_yield(state: &GameState, city_index: usize) -> ResourceYield
     let mut total = ResourceYield::default();
     for position in workable {
         if let Some(tile) = state.world.map.get(position) {
-            total += tile.terrain.base_yield();
+            total += tile.base_yield();
         }
     }
 
@@ -44,13 +44,13 @@ fn worked_positions(
             .world
             .map
             .get(*left)
-            .map(|tile| tile.terrain.base_yield().value())
+            .map(|tile| tile.base_yield().value())
             .unwrap_or_default();
         let right_value = state
             .world
             .map
             .get(*right)
-            .map(|tile| tile.terrain.base_yield().value())
+            .map(|tile| tile.base_yield().value())
             .unwrap_or_default();
 
         right_value
@@ -170,7 +170,7 @@ fn spawn_position(state: &GameState, city_index: usize) -> Option<TilePosition> 
                 .world
                 .map
                 .get(*position)
-                .map(|tile| tile.terrain.is_passable())
+                .map(|tile| tile.is_passable())
                 .unwrap_or(false)
     })
 }
@@ -180,6 +180,7 @@ mod tests {
     use super::{apply_economy, collect_city_yield};
     use crate::game::Game;
     use crate::terrain::TerrainType;
+    use crate::tile::TileMetadata;
 
     #[test]
     fn city_resource_production_works() {
@@ -224,5 +225,35 @@ mod tests {
         game.state.cities[0].food_storage = 0;
         apply_economy(&mut game.state);
         assert_eq!(game.state.cities[0].population, 2);
+    }
+
+    #[test]
+    fn fertile_coastal_tiles_improve_city_yield() {
+        let mut game = Game::new_default(11);
+        let city_pos = game.state.human_cities()[0].position;
+        let target = game
+            .state
+            .world
+            .map
+            .neighbors8(city_pos)
+            .into_iter()
+            .find(|position| *position != city_pos)
+            .unwrap();
+
+        let tile = game.state.world.map.get(target).unwrap().clone();
+        let boosted = crate::tile::Tile::with_metadata(
+            TerrainType::Plains,
+            TileMetadata {
+                fertility: 220,
+                ruggedness: 20,
+                coastal: true,
+                ..tile.metadata
+            },
+        );
+        game.state.world.map.set_tile(target, boosted);
+
+        let yield_generated = collect_city_yield(&game.state, 0);
+        assert!(yield_generated.food >= 3);
+        assert!(yield_generated.gold >= 1);
     }
 }

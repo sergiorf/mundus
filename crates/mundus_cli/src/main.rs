@@ -1,7 +1,7 @@
 use macroquad::prelude::*;
 use mundus_core::{
-    CityProjectKind, Game, GameConfig, GameOutcome, PlayerAction, TerrainType, TilePosition, World,
-    WorldConfig, WorldPreset,
+    site::score_founding_site, City, CityId, CityProjectKind, Game, GameConfig, GameOutcome,
+    Player, PlayerAction, PlayerId, TerrainType, TilePosition, Unit, UnitId, World, WorldPreset,
 };
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ const ZOOM_STEP: f32 = 0.2;
 const EARTH_RENDER_ROOT: &str = "assets/earth/render";
 const VIEWER_BACKGROUND: Color = Color::new(0.08, 0.11, 0.17, 1.0);
 const MAP_LIGHTEN_OVERLAY: Color = Color::new(1.0, 0.98, 0.92, 0.18);
+const FOUNDING_OVERLAY_INVALID: Color = Color::new(0.28, 0.12, 0.12, 0.34);
 
 fn window_conf() -> Conf {
     Conf {
@@ -86,10 +87,13 @@ async fn run_gui() {
 }
 
 struct TerrainViewer {
-    world: World,
-    seed: u64,
+    game: Game,
     camera: ViewerCamera,
     earth_layers: Vec<EarthRenderLayer>,
+    selected_city_id: Option<CityId>,
+    selected_unit_id: Option<UnitId>,
+    last_action_message: Option<String>,
+    show_founding_overlay: bool,
 }
 
 struct ViewerCamera {
@@ -115,28 +119,68 @@ struct EarthTextureTile {
 impl TerrainViewer {
     async fn new(seed: u64) -> Self {
         Self {
-            world: build_world(seed),
-            seed,
+            game: build_game(seed),
             camera: ViewerCamera {
                 tiles: vec2(0.0, 0.0),
                 zoom: 1.0,
                 drag_last_mouse: None,
             },
             earth_layers: load_earth_render_layers().await,
+            selected_city_id: None,
+            selected_unit_id: None,
+            last_action_message: None,
+            show_founding_overlay: false,
         }
     }
 
     fn update(&mut self) {
+        self.handle_turn_controls();
         self.handle_zoom();
         self.handle_keyboard_pan();
         self.handle_mouse_pan();
+        self.handle_selection();
+        self.handle_found_city();
+        self.handle_overlay_toggles();
 
         if is_key_pressed(KeyCode::R) {
-            self.seed += 1;
-            self.world = build_world(self.seed);
+            self.game.config.seed += 1;
+            self.game = build_game(self.game.config.seed);
+            self.selected_city_id = None;
+            self.selected_unit_id = None;
         }
 
         self.clamp_camera();
+    }
+
+    fn handle_overlay_toggles(&mut self) {
+        if is_key_pressed(KeyCode::Tab) {
+            self.show_founding_overlay = !self.show_founding_overlay;
+            self.last_action_message = Some(if self.show_founding_overlay {
+                "Founding overlay enabled.".to_string()
+            } else {
+                "Founding overlay disabled.".to_string()
+            });
+        }
+    }
+
+    fn handle_turn_controls(&mut self) {
+        if !(is_key_pressed(KeyCode::Space) || is_key_pressed(KeyCode::Enter)) {
+            return;
+        }
+
+        match self.game.end_turn() {
+            Ok(report) => {
+                self.last_action_message = Some(format!(
+                    "Turn {} complete. Score {}. {} events.",
+                    report.turn.0,
+                    report.player_score,
+                    report.events.len()
+                ));
+            }
+            Err(error) => {
+                self.last_action_message = Some(error.to_string());
+            }
+        }
     }
 
     fn handle_zoom(&mut self) {
@@ -186,6 +230,64 @@ impl TerrainViewer {
         }
     }
 
+    fn handle_selection(&mut self) {
+        if !is_mouse_button_pressed(MouseButton::Left) {
+            return;
+        }
+
+        if let Some(unit_id) = self.hovered_unit_id() {
+            self.selected_unit_id = Some(unit_id);
+            self.selected_city_id = None;
+            self.last_action_message = Some(format!("Selected unit {unit_id}."));
+        } else if let Some(city_id) = self.hovered_city_id() {
+            self.selected_city_id = Some(city_id);
+            self.selected_unit_id = None;
+            self.last_action_message = Some(format!("Selected city {city_id}."));
+        } else if let Some(unit_id) = self.selected_unit_id {
+            if let Some(target) = self.hovered_tile() {
+                match self.game.apply_action(PlayerAction::MoveUnit {
+                    unit_id,
+                    to: target,
+                }) {
+                    Ok(_) => {
+                        self.last_action_message =
+                            Some(format!("Unit {unit_id} moved to {target}."));
+                    }
+                    Err(error) => {
+                        self.last_action_message = Some(error.to_string());
+                    }
+                }
+            } else {
+                self.selected_city_id = None;
+                self.selected_unit_id = None;
+                self.last_action_message = None;
+            }
+        } else {
+            self.selected_city_id = None;
+            self.selected_unit_id = None;
+            self.last_action_message = None;
+        }
+    }
+
+    fn handle_found_city(&mut self) {
+        let Some(unit_id) = self.selected_unit_id else {
+            return;
+        };
+        if !is_key_pressed(KeyCode::F) {
+            return;
+        }
+
+        match self.game.apply_action(PlayerAction::FoundCity { unit_id }) {
+            Ok(_) => {
+                self.selected_unit_id = None;
+                self.last_action_message = Some(format!("Unit {unit_id} founded a city."));
+            }
+            Err(error) => {
+                self.last_action_message = Some(error.to_string());
+            }
+        }
+    }
+
     fn draw(&self) {
         clear_background(VIEWER_BACKGROUND);
 
@@ -193,10 +295,13 @@ impl TerrainViewer {
         let hovered = self.hovered_tile();
 
         self.draw_earth_background();
+        if self.show_founding_overlay {
+            self.draw_founding_overlay();
+        }
 
         if tile_size >= 8.0 {
-            for y in 0..self.world.map.height {
-                for x in 0..self.world.map.width {
+            for y in 0..self.world().map.height {
+                for x in 0..self.world().map.width {
                     let position = TilePosition::new(x, y);
                     let screen = self.tile_to_screen(position);
 
@@ -220,6 +325,9 @@ impl TerrainViewer {
             }
         }
 
+        self.draw_cities();
+        self.draw_units();
+
         if let Some(position) = hovered {
             let screen = self.tile_to_screen(position);
             draw_rectangle_lines(
@@ -232,6 +340,10 @@ impl TerrainViewer {
             );
         }
 
+        if let Some(unit) = self.selected_unit() {
+            self.draw_unit_move_hints(unit);
+        }
+
         self.draw_hud(hovered);
     }
 
@@ -240,8 +352,8 @@ impl TerrainViewer {
             return;
         };
 
-        let tile_world_width = self.world.map.width as f32 / layer.tiles_x as f32;
-        let tile_world_height = self.world.map.height as f32 / layer.tiles_y as f32;
+        let tile_world_width = self.world().map.width as f32 / layer.tiles_x as f32;
+        let tile_world_height = self.world().map.height as f32 / layer.tiles_y as f32;
         let tile_size = self.tile_size();
 
         for tile in &layer.tiles {
@@ -271,8 +383,8 @@ impl TerrainViewer {
         }
 
         let offset = self.viewport_offset(tile_size);
-        let map_width = self.world.map.width as f32 * tile_size;
-        let map_height = self.world.map.height as f32 * tile_size;
+        let map_width = self.world().map.width as f32 * tile_size;
+        let map_height = self.world().map.height as f32 * tile_size;
         draw_rectangle(
             offset.x,
             offset.y,
@@ -282,11 +394,121 @@ impl TerrainViewer {
         );
     }
 
+    fn draw_cities(&self) {
+        let hovered_city = self.hovered_city_id();
+        let show_labels = self.tile_size() >= 6.0;
+
+        for city in &self.game.state.cities {
+            let center = self.city_screen_center(city);
+            let radius = self.city_marker_radius(city);
+            let fill = self.player_color(city.owner);
+            let is_selected = self.selected_city_id == Some(city.id);
+            let is_hovered = hovered_city == Some(city.id);
+
+            draw_circle(center.x, center.y, radius, fill);
+            draw_circle_lines(center.x, center.y, radius + 1.0, 2.0, BLACK);
+
+            if city.is_capital {
+                draw_circle_lines(center.x, center.y, radius + 4.0, 2.5, GOLD);
+            }
+            if is_selected {
+                draw_circle_lines(center.x, center.y, radius + 7.0, 3.0, WHITE);
+            } else if is_hovered {
+                draw_circle_lines(
+                    center.x,
+                    center.y,
+                    radius + 5.0,
+                    2.0,
+                    Color::from_rgba(255, 255, 255, 210),
+                );
+            }
+
+            if show_labels {
+                let label = city.name.as_str();
+                let metrics = measure_text(label, None, 22, 1.0);
+                draw_text(
+                    label,
+                    center.x - metrics.width * 0.5,
+                    center.y - radius - 10.0,
+                    22.0,
+                    Color::from_rgba(248, 244, 232, 240),
+                );
+            }
+        }
+    }
+
+    fn draw_founding_overlay(&self) {
+        let tile_size = self.tile_size();
+        if tile_size < 2.0 {
+            return;
+        }
+
+        for y in 0..self.world().map.height {
+            for x in 0..self.world().map.width {
+                let position = TilePosition::new(x, y);
+                let screen = self.tile_to_screen(position);
+
+                if screen.x > screen_width()
+                    || screen.y > screen_height()
+                    || screen.x + tile_size < 0.0
+                    || screen.y + tile_size < 0.0
+                {
+                    continue;
+                }
+
+                let score = score_founding_site(&self.game.state, position);
+                let color = founding_overlay_color(&score);
+                draw_rectangle(screen.x, screen.y, tile_size, tile_size, color);
+            }
+        }
+    }
+
+    fn draw_units(&self) {
+        let hovered_unit = self.hovered_unit_id();
+
+        for unit in &self.game.state.units {
+            let center = self.unit_screen_center(unit);
+            let radius = self.unit_marker_radius();
+            let fill = self.player_color(unit.owner);
+            let is_selected = self.selected_unit_id == Some(unit.id);
+            let is_hovered = hovered_unit == Some(unit.id);
+
+            draw_poly(center.x, center.y, 4, radius, 45.0, fill);
+            draw_poly_lines(center.x, center.y, 4, radius + 1.0, 45.0, 2.0, BLACK);
+
+            if is_selected {
+                draw_circle_lines(center.x, center.y, radius + 7.0, 3.0, WHITE);
+            } else if is_hovered {
+                draw_circle_lines(
+                    center.x,
+                    center.y,
+                    radius + 5.0,
+                    2.0,
+                    Color::from_rgba(255, 255, 255, 210),
+                );
+            }
+
+            if self.tile_size() >= 12.0 {
+                draw_text(
+                    if unit.kind.as_str() == "Settler" {
+                        "S"
+                    } else {
+                        "M"
+                    },
+                    center.x - 7.0,
+                    center.y + 6.0,
+                    20.0,
+                    Color::from_rgba(250, 245, 233, 240),
+                );
+            }
+        }
+    }
+
     fn draw_hud(&self, hovered: Option<TilePosition>) {
         draw_rectangle(16.0, 16.0, 430.0, 116.0, Color::from_rgba(11, 19, 30, 220));
         draw_text("Mundus Terrain Viewer", 28.0, 44.0, 32.0, WHITE);
         draw_text(
-            "Wheel: zoom  |  Right/Middle drag: pan  |  WASD/Arrows: move  |  R: regenerate",
+            "Wheel: zoom  |  Left click: select or move  |  F: found city  |  Tab: founding overlay  |  Space: end turn",
             28.0,
             72.0,
             20.0,
@@ -295,10 +517,10 @@ impl TerrainViewer {
         draw_text(
             &format!(
                 "preset=earth  seed={}  zoom={:.2}  map={}x{}  render={}  --cli: text mode",
-                self.seed,
+                self.game.config.seed,
                 self.camera.zoom,
-                self.world.map.width,
-                self.world.map.height,
+                self.world().map.width,
+                self.world().map.height,
                 self.active_earth_layer_name(),
             ),
             28.0,
@@ -308,17 +530,25 @@ impl TerrainViewer {
         );
 
         if let Some(position) = hovered {
-            if let Some(tile) = self.world.map.get(position) {
+            if let Some(tile) = self.world().map.get(position) {
+                let founding = score_founding_site(&self.game.state, position);
                 let info = format!(
-                    "tile=({}, {})  terrain={}  passable={}  yield=f{} p{} g{} k{}",
+                    "tile=({}, {})  terrain={}  biome={}  passable={}  coast={}  elev={}  moist={}  temp={}  found={}  score={}  yield=f{} p{} g{} k{}",
                     position.x,
                     position.y,
-                    terrain_name(&self.world, position),
-                    tile.terrain.is_passable(),
-                    tile.terrain.base_yield().food,
-                    tile.terrain.base_yield().production,
-                    tile.terrain.base_yield().gold,
-                    tile.terrain.base_yield().knowledge,
+                    terrain_name(self.world(), position),
+                    tile.metadata.biome.as_str(),
+                    tile.is_passable(),
+                    tile.metadata.coastal,
+                    tile.metadata.elevation,
+                    tile.metadata.moisture,
+                    tile.metadata.temperature,
+                    founding.valid,
+                    founding.total,
+                    tile.base_yield().food,
+                    tile.base_yield().production,
+                    tile.base_yield().gold,
+                    tile.base_yield().knowledge,
                 );
                 let width = measure_text(&info, None, 24, 1.0).width + 32.0;
                 let y = screen_height() - 54.0;
@@ -332,6 +562,160 @@ impl TerrainViewer {
                 draw_text(&info, 28.0, y, 24.0, WHITE);
             }
         }
+
+        if let Some(message) = &self.last_action_message {
+            let width = measure_text(message, None, 24, 1.0).width + 32.0;
+            let x = screen_width() - width - 18.0;
+            let y = screen_height() - 28.0;
+            draw_rectangle(x, y - 30.0, width, 42.0, Color::from_rgba(11, 19, 30, 220));
+            draw_text(message, x + 16.0, y, 24.0, WHITE);
+        }
+
+        if let Some(city) = self.selected_city() {
+            self.draw_city_panel(city);
+        } else if let Some(unit) = self.selected_unit() {
+            self.draw_unit_panel(unit);
+        }
+    }
+
+    fn draw_city_panel(&self, city: &City) {
+        let panel_width = 360.0;
+        let panel_height = 316.0;
+        let x = screen_width() - panel_width - 18.0;
+        let y = 18.0;
+        let panel = Color::from_rgba(242, 232, 208, 238);
+        let inset = Color::from_rgba(82, 61, 39, 235);
+        let text = Color::from_rgba(44, 34, 24, 255);
+        let accent = self.player_color(city.owner);
+        let owner_name = self
+            .player(city.owner)
+            .map(|player| player.name.as_str())
+            .unwrap_or("Unknown");
+        let improvements = [
+            city.has_granary.then_some("Granary"),
+            city.has_workshop.then_some("Workshop"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let improvements = if improvements.is_empty() {
+            "None".to_string()
+        } else {
+            improvements.join(", ")
+        };
+
+        draw_rectangle(x, y, panel_width, panel_height, panel);
+        draw_rectangle_lines(x, y, panel_width, panel_height, 3.0, inset);
+        draw_rectangle(x + 16.0, y + 16.0, panel_width - 32.0, 44.0, accent);
+        draw_text(&city.name, x + 28.0, y + 47.0, 30.0, WHITE);
+        draw_text(
+            if city.is_capital { "Capital" } else { "City" },
+            x + panel_width - 110.0,
+            y + 46.0,
+            24.0,
+            Color::from_rgba(252, 247, 232, 240),
+        );
+
+        let lines = [
+            format!("Owner: {owner_name}"),
+            format!("Population: {}", city.population),
+            format!("Hit points: {}", city.hit_points),
+            format!("Defense: {}", city.defense_strength()),
+            format!("Food: {} / {}", city.food_storage, city.growth_threshold()),
+            format!(
+                "Project: {} ({}/{})",
+                city.current_project.kind.as_str(),
+                city.current_project.invested,
+                city.current_project.kind.cost()
+            ),
+            format!("Buildings: {improvements}"),
+            format!("Tile: {}", city.position),
+        ];
+
+        for (index, line) in lines.iter().enumerate() {
+            draw_text(line, x + 28.0, y + 94.0 + index as f32 * 28.0, 24.0, text);
+        }
+    }
+
+    fn draw_unit_panel(&self, unit: &Unit) {
+        let panel_width = 320.0;
+        let panel_height = 220.0;
+        let x = screen_width() - panel_width - 18.0;
+        let y = 18.0;
+        let panel = Color::from_rgba(228, 236, 242, 236);
+        let inset = Color::from_rgba(38, 54, 71, 235);
+        let text = Color::from_rgba(24, 33, 42, 255);
+        let accent = self.player_color(unit.owner);
+        let owner_name = self
+            .player(unit.owner)
+            .map(|player| player.name.as_str())
+            .unwrap_or("Unknown");
+
+        draw_rectangle(x, y, panel_width, panel_height, panel);
+        draw_rectangle_lines(x, y, panel_width, panel_height, 3.0, inset);
+        draw_rectangle(x + 16.0, y + 16.0, panel_width - 32.0, 44.0, accent);
+        draw_text(unit.kind.as_str(), x + 28.0, y + 47.0, 30.0, WHITE);
+
+        let lines = [
+            format!("Owner: {owner_name}"),
+            format!("Hit points: {}", unit.hit_points),
+            format!(
+                "Movement: {}/{}",
+                unit.movement_points, unit.max_movement_points
+            ),
+            format!("Strength: {}", unit.strength),
+            format!("Tile: {}", unit.position),
+        ];
+
+        for (index, line) in lines.iter().enumerate() {
+            draw_text(line, x + 28.0, y + 94.0 + index as f32 * 28.0, 24.0, text);
+        }
+    }
+
+    fn draw_unit_move_hints(&self, unit: &Unit) {
+        if unit.movement_points <= 0 {
+            return;
+        }
+
+        let range = unit.movement_points as usize;
+        let world = self.world();
+
+        for y in 0..world.map.height {
+            for x in 0..world.map.width {
+                let position = TilePosition::new(x, y);
+                let distance = unit.position.manhattan_distance(position);
+                if distance == 0 || distance > range {
+                    continue;
+                }
+
+                let Some(tile) = world.map.get(position) else {
+                    continue;
+                };
+                if !tile.is_passable() {
+                    continue;
+                }
+                if self
+                    .game
+                    .state
+                    .units
+                    .iter()
+                    .any(|other| other.id != unit.id && other.position == position)
+                {
+                    continue;
+                }
+
+                let screen = self.tile_to_screen(position);
+                let inset = self.tile_size() * 0.18;
+                let size = (self.tile_size() - inset * 2.0).max(2.0);
+                draw_rectangle(
+                    screen.x + inset,
+                    screen.y + inset,
+                    size,
+                    size,
+                    Color::from_rgba(116, 197, 122, 72),
+                );
+            }
+        }
     }
 
     fn tile_size(&self) -> f32 {
@@ -339,8 +723,8 @@ impl TerrainViewer {
     }
 
     fn fitted_tile_size(&self) -> f32 {
-        let fit_x = screen_width() / self.world.map.width as f32;
-        let fit_y = screen_height() / self.world.map.height as f32;
+        let fit_x = screen_width() / self.world().map.width as f32;
+        let fit_y = screen_height() / self.world().map.height as f32;
         fit_x.min(fit_y).max(0.0001)
     }
 
@@ -354,8 +738,8 @@ impl TerrainViewer {
     }
 
     fn viewport_offset(&self, tile_size: f32) -> Vec2 {
-        let map_width = self.world.map.width as f32 * tile_size;
-        let map_height = self.world.map.height as f32 * tile_size;
+        let map_width = self.world().map.width as f32 * tile_size;
+        let map_height = self.world().map.height as f32 * tile_size;
         vec2(
             ((screen_width() - map_width) * 0.5).max(0.0),
             ((screen_height() - map_height) * 0.5).max(0.0),
@@ -367,7 +751,7 @@ impl TerrainViewer {
         self.earth_layers
             .iter()
             .find(|layer| {
-                layer.pixels_per_world_tile(self.world.map.width) >= target_pixels_per_world_tile
+                layer.pixels_per_world_tile(self.world().map.width) >= target_pixels_per_world_tile
             })
             .or_else(|| self.earth_layers.last())
     }
@@ -400,16 +784,101 @@ impl TerrainViewer {
             return None;
         }
         let position = TilePosition::new(x as usize, y as usize);
-        self.world.map.in_bounds(position).then_some(position)
+        self.world().map.in_bounds(position).then_some(position)
+    }
+
+    fn hovered_city_id(&self) -> Option<CityId> {
+        let mouse = vec2(mouse_position().0, mouse_position().1);
+        self.game
+            .state
+            .cities
+            .iter()
+            .find(|city| {
+                let center = self.city_screen_center(city);
+                let radius = self.city_marker_radius(city) + 6.0;
+                center.distance(mouse) <= radius
+            })
+            .map(|city| city.id)
+    }
+
+    fn hovered_unit_id(&self) -> Option<UnitId> {
+        let mouse = vec2(mouse_position().0, mouse_position().1);
+        self.game
+            .state
+            .units
+            .iter()
+            .find(|unit| {
+                let center = self.unit_screen_center(unit);
+                let radius = self.unit_marker_radius() + 6.0;
+                center.distance(mouse) <= radius
+            })
+            .map(|unit| unit.id)
     }
 
     fn clamp_camera(&mut self) {
         let visible_tiles_x = screen_width() / self.tile_size();
         let visible_tiles_y = screen_height() / self.tile_size();
-        let max_x = (self.world.map.width as f32 - visible_tiles_x).max(0.0);
-        let max_y = (self.world.map.height as f32 - visible_tiles_y).max(0.0);
+        let max_x = (self.world().map.width as f32 - visible_tiles_x).max(0.0);
+        let max_y = (self.world().map.height as f32 - visible_tiles_y).max(0.0);
         self.camera.tiles.x = self.camera.tiles.x.clamp(0.0, max_x);
         self.camera.tiles.y = self.camera.tiles.y.clamp(0.0, max_y);
+    }
+
+    fn city_screen_center(&self, city: &City) -> Vec2 {
+        let top_left = self.tile_to_screen(city.position);
+        let half = self.tile_size() * 0.5;
+        vec2(top_left.x + half, top_left.y + half)
+    }
+
+    fn unit_screen_center(&self, unit: &Unit) -> Vec2 {
+        let top_left = self.tile_to_screen(unit.position);
+        let half = self.tile_size() * 0.5;
+        vec2(top_left.x + half, top_left.y + half)
+    }
+
+    fn city_marker_radius(&self, city: &City) -> f32 {
+        let base: f32 = if city.is_capital { 8.0 } else { 6.0 };
+        base.max((self.tile_size() * 0.4).min(14.0))
+    }
+
+    fn unit_marker_radius(&self) -> f32 {
+        6.0_f32.max((self.tile_size() * 0.32).min(12.0))
+    }
+
+    fn selected_city(&self) -> Option<&City> {
+        let city_id = self.selected_city_id?;
+        self.game
+            .state
+            .cities
+            .iter()
+            .find(|city| city.id == city_id)
+    }
+
+    fn selected_unit(&self) -> Option<&Unit> {
+        let unit_id = self.selected_unit_id?;
+        self.game.state.units.iter().find(|unit| unit.id == unit_id)
+    }
+
+    fn player(&self, player_id: PlayerId) -> Option<&Player> {
+        self.game
+            .state
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+    }
+
+    fn player_color(&self, player_id: PlayerId) -> Color {
+        if player_id == self.game.state.human_player_id {
+            Color::from_rgba(199, 71, 74, 255)
+        } else if player_id == self.game.state.ai_player_id {
+            Color::from_rgba(64, 112, 184, 255)
+        } else {
+            Color::from_rgba(118, 124, 133, 255)
+        }
+    }
+
+    fn world(&self) -> &mundus_core::World {
+        &self.game.state.world
     }
 }
 
@@ -423,10 +892,14 @@ impl EarthRenderLayer {
     }
 }
 
-fn build_world(seed: u64) -> World {
-    World::generate(
-        WorldConfig::new(WORLD_MAP_WIDTH, WORLD_MAP_HEIGHT, seed).with_preset(WorldPreset::Earth),
-    )
+fn build_game(seed: u64) -> Game {
+    Game::new(GameConfig {
+        seed,
+        map_width: WORLD_MAP_WIDTH,
+        map_height: WORLD_MAP_HEIGHT,
+        world_preset: WorldPreset::Earth,
+        ..GameConfig::default()
+    })
 }
 
 async fn load_earth_render_layers() -> Vec<EarthRenderLayer> {
@@ -504,14 +977,21 @@ async fn load_earth_render_layer(lod: u8, dir: &Path) -> Option<EarthRenderLayer
 }
 
 fn terrain_name(world: &World, position: TilePosition) -> &'static str {
-    let terrain = world.map.get(position).expect("tile in bounds").terrain;
-    if is_coast_tile(world, position) {
+    let tile = world.map.get(position).expect("tile in bounds");
+    let terrain = tile.terrain;
+    if tile.metadata.coastal
+        && matches!(
+            terrain,
+            TerrainType::Plains | TerrainType::Forest | TerrainType::Desert | TerrainType::Tundra
+        )
+    {
         return "Coast";
     }
 
     match terrain {
         TerrainType::Plains => "Plains",
         TerrainType::Forest => "Forest",
+        TerrainType::Tundra => "Tundra",
         TerrainType::Hills => "Hills",
         TerrainType::River => "River",
         TerrainType::Mountain => "Mountain",
@@ -520,21 +1000,23 @@ fn terrain_name(world: &World, position: TilePosition) -> &'static str {
     }
 }
 
-fn is_coast_tile(world: &World, position: TilePosition) -> bool {
-    let tile = world.map.get(position).expect("tile in bounds");
-    tile.terrain != TerrainType::Water
-        && world
-            .map
-            .neighbors8(position)
-            .into_iter()
-            .filter(|neighbor| *neighbor != position)
-            .any(|neighbor| {
-                world
-                    .map
-                    .get(neighbor)
-                    .map(|neighbor_tile| neighbor_tile.terrain == TerrainType::Water)
-                    .unwrap_or(false)
-            })
+fn founding_overlay_color(score: &mundus_core::FoundingSiteScore) -> Color {
+    if !score.valid {
+        return FOUNDING_OVERLAY_INVALID;
+    }
+
+    let normalized = ((score.total + 8) as f32 / 36.0).clamp(0.0, 1.0);
+    let red = if normalized < 0.5 {
+        0.78
+    } else {
+        (1.0 - normalized) * 1.56
+    };
+    let green = if normalized < 0.5 {
+        normalized * 1.56
+    } else {
+        0.78
+    };
+    Color::new(red.clamp(0.0, 0.78), green.clamp(0.0, 0.78), 0.14, 0.32)
 }
 
 fn handle_command(game: &mut Game, command: &str) -> Result<bool, String> {
@@ -579,6 +1061,13 @@ fn handle_command(game: &mut Game, command: &str) -> Result<bool, String> {
             .map_err(|error| error.to_string())?;
             println!("City attacked.");
         }
+        ["found-city", unit_id] => {
+            game.apply_action(PlayerAction::FoundCity {
+                unit_id: mundus_core::UnitId(parse_u32(unit_id)?),
+            })
+            .map_err(|error| error.to_string())?;
+            println!("City founded.");
+        }
         ["end"] => {
             let report = game.end_turn().map_err(|error| error.to_string())?;
             println!(
@@ -616,6 +1105,7 @@ fn print_help() {
     println!("move <unit_id> <x> <y>");
     println!("attack-unit <unit_id> <target_unit_id>");
     println!("attack-city <unit_id> <target_city_id>");
+    println!("found-city <unit_id>");
     println!("end");
     println!("quit");
 }
@@ -681,7 +1171,7 @@ fn print_units(game: &Game) {
         println!(
             "{}: {:?} at {} hp={} str={} move={}/{}",
             unit.id,
-            unit.kind,
+            unit.kind.as_str(),
             unit.position,
             unit.hit_points,
             unit.strength,

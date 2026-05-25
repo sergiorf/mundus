@@ -4,24 +4,35 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnitKind {
     Militia,
+    Settler,
 }
 
 impl UnitKind {
     pub const fn max_hit_points(self) -> i32 {
         match self {
             Self::Militia => 10,
+            Self::Settler => 6,
         }
     }
 
     pub const fn strength(self) -> i32 {
         match self {
             Self::Militia => 6,
+            Self::Settler => 0,
         }
     }
 
     pub const fn max_movement(self) -> i32 {
         match self {
             Self::Militia => 1,
+            Self::Settler => 1,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Militia => "Militia",
+            Self::Settler => "Settler",
         }
     }
 }

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum TerrainType {
     Plains,
     Forest,
+    Tundra,
     Hills,
     River,
     Mountain,
@@ -25,6 +26,7 @@ impl TerrainType {
         match self {
             Self::Plains => ResourceYield::new(2, 1, 0, 0),
             Self::Forest => ResourceYield::new(1, 2, 0, 0),
+            Self::Tundra => ResourceYield::new(1, 0, 0, 1),
             Self::Hills => ResourceYield::new(0, 3, 0, 0),
             Self::River => ResourceYield::new(2, 0, 1, 0),
             Self::Mountain => ResourceYield::new(0, 1, 0, 1),
@@ -41,6 +43,7 @@ impl TerrainType {
         match self {
             Self::Plains => '.',
             Self::Forest => 'F',
+            Self::Tundra => 'T',
             Self::Hills => 'H',
             Self::River => 'R',
             Self::Mountain => 'M',
@@ -64,6 +67,10 @@ mod tests {
         assert_eq!(
             TerrainType::Forest.base_yield(),
             ResourceYield::new(1, 2, 0, 0)
+        );
+        assert_eq!(
+            TerrainType::Tundra.base_yield(),
+            ResourceYield::new(1, 0, 0, 1)
         );
         assert_eq!(
             TerrainType::Hills.base_yield(),

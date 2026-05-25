@@ -6,9 +6,10 @@ use crate::ids::{CityId, PlayerId, TilePosition, TurnNumber, UnitId};
 use crate::movement::move_unit;
 use crate::player::Player;
 use crate::resources::ResourceStockpile;
+use crate::site::found_city_from_unit;
 use crate::turn::end_turn;
 use crate::unit::{Unit, UnitKind};
-use crate::world::{World, WorldConfig};
+use crate::world::{World, WorldConfig, WorldPreset};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +32,7 @@ pub struct GameConfig {
     pub seed: u64,
     pub map_width: usize,
     pub map_height: usize,
+    pub world_preset: WorldPreset,
     pub max_turns: u32,
     pub target_score: i32,
 }
@@ -41,6 +43,7 @@ impl Default for GameConfig {
             seed: 1,
             map_width: 10,
             map_height: 10,
+            world_preset: WorldPreset::Procedural,
             max_turns: 80,
             target_score: 260,
         }
@@ -126,6 +129,12 @@ impl GameState {
         self.next_unit_id_value += 1;
         id
     }
+
+    pub fn next_city_id(&mut self) -> CityId {
+        let id = CityId(self.next_city_id_value);
+        self.next_city_id_value += 1;
+        id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,34 +147,51 @@ impl Game {
     pub fn new(config: GameConfig) -> Self {
         let human_player_id = PlayerId(1);
         let ai_player_id = PlayerId(2);
-        let mut world = World::generate(WorldConfig::new(
-            config.map_width,
-            config.map_height,
-            config.seed,
-        ));
+        let mut world = World::generate(
+            WorldConfig::new(config.map_width, config.map_height, config.seed)
+                .with_preset(config.world_preset),
+        );
 
-        let human_capital_position = TilePosition::new(
+        let human_anchor = TilePosition::new(
             (config.map_width / 4).max(2),
             (config.map_height / 2).saturating_sub(2).max(2),
         );
-        let ai_capital_position = TilePosition::new(
+        let ai_anchor = TilePosition::new(
             (config.map_width * 3 / 4).min(config.map_width.saturating_sub(3)),
             (config.map_height / 2 + 2).min(config.map_height.saturating_sub(3)),
         );
-        let human_unit_position = TilePosition::new(
-            (human_capital_position.x + 1).min(config.map_width.saturating_sub(2)),
-            human_capital_position.y,
-        );
-        let ai_unit_position = TilePosition::new(
-            ai_capital_position.x.saturating_sub(1).max(1),
-            ai_capital_position.y,
-        );
+        let human_capital_position =
+            find_land_position(&world, human_anchor).unwrap_or(human_anchor);
+        let ai_capital_position = find_land_position_away_from(
+            &world,
+            ai_anchor,
+            human_capital_position,
+            config.map_width / 3,
+        )
+        .or_else(|| find_land_position(&world, ai_anchor))
+        .unwrap_or(ai_anchor);
+        let human_starts =
+            find_adjacent_land_positions(&world, human_capital_position, ai_capital_position);
+        let ai_starts =
+            find_adjacent_land_positions(&world, ai_capital_position, human_capital_position);
+        let human_unit_position = human_starts
+            .first()
+            .copied()
+            .unwrap_or(human_capital_position);
+        let human_settler_position = human_starts
+            .get(1)
+            .copied()
+            .unwrap_or(human_capital_position);
+        let ai_unit_position = ai_starts.first().copied().unwrap_or(ai_capital_position);
+        let ai_settler_position = ai_starts.get(1).copied().unwrap_or(ai_capital_position);
 
         for position in [
             human_capital_position,
             ai_capital_position,
             human_unit_position,
             ai_unit_position,
+            human_settler_position,
+            ai_settler_position,
         ] {
             world
                 .map
@@ -225,7 +251,19 @@ impl Game {
                 UnitKind::Militia,
                 human_unit_position,
             ),
-            Unit::new(UnitId(2), ai_player_id, UnitKind::Militia, ai_unit_position),
+            Unit::new(
+                UnitId(2),
+                human_player_id,
+                UnitKind::Settler,
+                human_settler_position,
+            ),
+            Unit::new(UnitId(3), ai_player_id, UnitKind::Militia, ai_unit_position),
+            Unit::new(
+                UnitId(4),
+                ai_player_id,
+                UnitKind::Settler,
+                ai_settler_position,
+            ),
         ];
 
         Self {
@@ -241,7 +279,7 @@ impl Game {
                 ai_player_id,
                 next_player_id_value: 3,
                 next_city_id_value: 3,
-                next_unit_id_value: 3,
+                next_unit_id_value: 5,
             },
         }
     }
@@ -294,9 +332,11 @@ impl Game {
                 city.current_project.invested = 0;
                 Ok(None)
             }
-            PlayerAction::FoundCity { .. } => Err(GameError::InvalidAction(
-                "found city is not implemented in v0",
-            )),
+            PlayerAction::FoundCity { unit_id } => {
+                self.ensure_human_unit(unit_id)?;
+                found_city_from_unit(&mut self.state, unit_id)?;
+                Ok(None)
+            }
         }
     }
 
@@ -319,6 +359,67 @@ impl Game {
     }
 }
 
+fn find_land_position(world: &World, anchor: TilePosition) -> Option<TilePosition> {
+    positions_by_distance(world.map.width, world.map.height, anchor)
+        .into_iter()
+        .find(|&position| is_land_tile(world, position))
+}
+
+fn find_land_position_away_from(
+    world: &World,
+    anchor: TilePosition,
+    avoid: TilePosition,
+    min_distance: usize,
+) -> Option<TilePosition> {
+    positions_by_distance(world.map.width, world.map.height, anchor)
+        .into_iter()
+        .find(|&position| {
+            is_land_tile(world, position) && position.manhattan_distance(avoid) >= min_distance
+        })
+}
+
+fn find_adjacent_land_positions(
+    world: &World,
+    center: TilePosition,
+    prefer_away_from: TilePosition,
+) -> Vec<TilePosition> {
+    let mut neighbors = world
+        .map
+        .neighbors8(center)
+        .into_iter()
+        .filter(|&position| position != center && is_land_tile(world, position))
+        .collect::<Vec<_>>();
+    neighbors
+        .sort_by_key(|position| std::cmp::Reverse(position.manhattan_distance(prefer_away_from)));
+    neighbors
+}
+
+fn is_land_tile(world: &World, position: TilePosition) -> bool {
+    world
+        .map
+        .get(position)
+        .map(|tile| tile.is_land())
+        .unwrap_or(false)
+}
+
+fn positions_by_distance(width: usize, height: usize, anchor: TilePosition) -> Vec<TilePosition> {
+    let mut positions = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            positions.push(TilePosition::new(x, y));
+        }
+    }
+
+    positions.sort_by_key(|position| {
+        (
+            position.manhattan_distance(anchor),
+            position.y.abs_diff(anchor.y),
+            position.x.abs_diff(anchor.x),
+        )
+    });
+    positions
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Game, GameOutcome};
@@ -326,6 +427,7 @@ mod tests {
     use crate::city::CityProjectKind;
     use crate::ids::TilePosition;
     use crate::terrain::TerrainType;
+    use crate::world::WorldPreset;
     use serde_json::to_string;
 
     #[test]
@@ -342,11 +444,28 @@ mod tests {
     fn same_seed_and_same_actions_produce_same_result() {
         let mut left = Game::new_default(9);
         let mut right = Game::new_default(9);
-        let move_target = TilePosition::new(
-            (left.state.human_units()[0].position.x + 1)
-                .min(left.state.world.map.width.saturating_sub(2)),
-            left.state.human_units()[0].position.y,
-        );
+        let unit_id = left.state.human_units()[0].id;
+        let right_unit_id = right.state.human_units()[0].id;
+        let start = left.state.human_units()[0].position;
+        let move_target = left
+            .state
+            .world
+            .map
+            .neighbors8(start)
+            .into_iter()
+            .find(|position| {
+                *position != start
+                    && start.manhattan_distance(*position) == 1
+                    && left.state.unit_at(*position).is_none()
+                    && left
+                        .state
+                        .world
+                        .map
+                        .get(*position)
+                        .map(|tile| tile.is_passable())
+                        .unwrap_or(false)
+            })
+            .unwrap();
         left.state
             .world
             .map
@@ -356,8 +475,6 @@ mod tests {
             .world
             .map
             .set_terrain(move_target, TerrainType::Plains);
-        let unit_id = left.state.human_units()[0].id;
-        let right_unit_id = right.state.human_units()[0].id;
         let city_id = left.state.human_cities()[0].id;
         let right_city_id = right.state.human_cities()[0].id;
 
@@ -394,5 +511,49 @@ mod tests {
             to_string(&left.state).unwrap(),
             to_string(&right.state).unwrap()
         );
+    }
+
+    #[test]
+    fn earth_preset_places_starting_cities_on_land() {
+        let game = Game::new(super::GameConfig {
+            seed: 7,
+            map_width: 360,
+            map_height: 180,
+            world_preset: WorldPreset::Earth,
+            ..super::GameConfig::default()
+        });
+
+        for city in &game.state.cities {
+            let tile = game.state.world.map.get(city.position).unwrap();
+            assert_ne!(tile.terrain, TerrainType::Water);
+        }
+    }
+
+    #[test]
+    fn settler_can_found_city_and_is_consumed() {
+        let mut game = Game::new_default(7);
+        let settler_id = game
+            .state
+            .human_units()
+            .into_iter()
+            .find(|unit| unit.kind == crate::unit::UnitKind::Settler)
+            .unwrap()
+            .id;
+        let valid_site = (0..game.state.world.map.height)
+            .flat_map(|y| (0..game.state.world.map.width).map(move |x| TilePosition::new(x, y)))
+            .find(|position| crate::site::score_founding_site(&game.state, *position).valid)
+            .unwrap();
+        game.state.unit_mut(settler_id).unwrap().position = valid_site;
+        let original_city_count = game.state.cities.len();
+        let original_unit_count = game.state.units.len();
+
+        game.apply_action(PlayerAction::FoundCity {
+            unit_id: settler_id,
+        })
+        .unwrap();
+
+        assert_eq!(game.state.cities.len(), original_city_count + 1);
+        assert_eq!(game.state.units.len(), original_unit_count - 1);
+        assert!(game.state.unit(settler_id).is_none());
     }
 }

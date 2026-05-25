@@ -1,7 +1,7 @@
 use crate::map::Map;
 use crate::rng::SeededRng;
 use crate::terrain::TerrainType;
-use crate::tile::Tile;
+use crate::tile::{Tile, TileMetadata};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -340,10 +340,12 @@ fn paint_procedural_terrain(
     continents: &[ContinentSeed],
     land_mask: &[bool],
 ) {
+    let inland_scale = (config.width.max(config.height) as f32 * 0.18).max(1.0);
+    let distance_to_water = distance_to_water_map(config, land_mask);
+
     for y in 0..config.height {
         for x in 0..config.width {
             let index = y * config.width + x;
-            let position = crate::ids::TilePosition::new(x, y);
             if !land_mask[index] {
                 map.tiles[index] = Tile::new(TerrainType::Water);
                 continue;
@@ -353,6 +355,8 @@ fn paint_procedural_terrain(
             let elevation = tile_elevation(x as f32, y as f32, continents);
             let moisture = tile_noise(config.seed, x, y, 0x4F1B_C123);
             let aridity = tile_noise(config.seed, x, y, 0x91D2_77AA);
+            let latitude = normalized_latitude(y, config.height);
+            let water_distance = distance_to_water[index];
 
             let terrain = if elevation > 0.66 && moisture < 0.62 {
                 TerrainType::Mountain
@@ -360,6 +364,8 @@ fn paint_procedural_terrain(
                 TerrainType::Hills
             } else if water_neighbors >= 3 && moisture > 0.52 {
                 TerrainType::River
+            } else if latitude > 0.72 && moisture < 0.58 {
+                TerrainType::Tundra
             } else if water_neighbors >= 2 && aridity > 0.78 {
                 TerrainType::Desert
             } else if moisture > 0.57 {
@@ -368,7 +374,16 @@ fn paint_procedural_terrain(
                 TerrainType::Plains
             };
 
-            map.set_terrain(position, terrain);
+            let temperature = (1.0 - latitude).clamp(0.0, 1.0);
+            let metadata = build_tile_metadata(
+                terrain,
+                elevation.clamp(0.0, 1.0),
+                moisture.clamp(0.0, 1.0),
+                temperature,
+                quantize_water_distance(water_distance, inland_scale),
+                water_neighbors > 0 && terrain.is_land(),
+            );
+            map.tiles[index] = Tile::with_metadata(terrain, metadata);
         }
     }
 }
@@ -426,7 +441,6 @@ fn paint_earth_terrain(map: &mut Map, config: WorldConfig, land_mask: &[bool]) {
     for y in 0..config.height {
         for x in 0..config.width {
             let index = y * config.width + x;
-            let position = crate::ids::TilePosition::new(x, y);
             if !land_mask[index] {
                 map.tiles[index] = Tile::new(TerrainType::Water);
                 continue;
@@ -458,6 +472,8 @@ fn paint_earth_terrain(map: &mut Map, config: WorldConfig, land_mask: &[bool]) {
                 TerrainType::Hills
             } else if water_neighbors >= 3 && moisture > 0.42 && elevation < 0.58 {
                 TerrainType::River
+            } else if latitude > 0.74 && heat < 0.26 {
+                TerrainType::Tundra
             } else if desert_score + continentality * 0.35 > 0.48 && moisture < 0.34 && heat > 0.35
             {
                 TerrainType::Desert
@@ -467,7 +483,15 @@ fn paint_earth_terrain(map: &mut Map, config: WorldConfig, land_mask: &[bool]) {
                 TerrainType::Plains
             };
 
-            map.set_terrain(position, terrain);
+            let metadata = build_tile_metadata(
+                terrain,
+                elevation.clamp(0.0, 1.0),
+                moisture.clamp(0.0, 1.0),
+                heat.clamp(0.0, 1.0),
+                quantize_water_distance(distance_to_water[index], inland_scale),
+                water_neighbors > 0 && terrain.is_land(),
+            );
+            map.tiles[index] = Tile::with_metadata(terrain, metadata);
         }
     }
 }
@@ -611,6 +635,94 @@ fn tile_noise(seed: u64, x: usize, y: usize, salt: u64) -> f32 {
     (value as u32 as f32) / (u32::MAX as f32)
 }
 
+fn quantize_unit(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn quantize_water_distance(distance: u16, inland_scale: f32) -> u8 {
+    quantize_unit((distance as f32 / inland_scale.max(1.0)).clamp(0.0, 1.0))
+}
+
+fn build_tile_metadata(
+    terrain: TerrainType,
+    elevation: f32,
+    moisture: f32,
+    temperature: f32,
+    water_distance: u8,
+    coastal: bool,
+) -> TileMetadata {
+    let ruggedness = match terrain {
+        TerrainType::Mountain => (elevation * 255.0).max(210.0),
+        TerrainType::Hills => (elevation * 255.0).max(155.0),
+        TerrainType::Forest => (elevation * 255.0).max(90.0),
+        _ => elevation * 255.0,
+    };
+    let fertility = match terrain {
+        TerrainType::River => (moisture * 255.0).max(210.0),
+        TerrainType::Plains => (moisture * 0.7 + temperature * 0.2 + 0.15) * 255.0,
+        TerrainType::Forest => (moisture * 0.55 + 0.15) * 255.0,
+        TerrainType::Tundra => (moisture * 0.35 + temperature * 0.15) * 255.0,
+        TerrainType::Desert => 18.0,
+        TerrainType::Mountain => 28.0,
+        TerrainType::Water => 0.0,
+        TerrainType::Hills => (moisture * 0.3 + 0.1) * 255.0,
+    };
+
+    TileMetadata {
+        elevation: quantize_unit(elevation),
+        moisture: quantize_unit(moisture),
+        temperature: quantize_unit(temperature),
+        fertility: fertility.clamp(0.0, 255.0) as u8,
+        ruggedness: ruggedness.clamp(0.0, 255.0) as u8,
+        water_distance,
+        coastal,
+        biome: classify_biome(terrain, moisture, temperature, coastal),
+    }
+}
+
+fn classify_biome(
+    terrain: TerrainType,
+    moisture: f32,
+    temperature: f32,
+    coastal: bool,
+) -> crate::tile::Biome {
+    use crate::tile::Biome;
+
+    match terrain {
+        TerrainType::Water => Biome::Ocean,
+        TerrainType::River => Biome::Riverine,
+        TerrainType::Mountain => Biome::Alpine,
+        TerrainType::Desert => Biome::Arid,
+        TerrainType::Tundra => {
+            if temperature < 0.14 {
+                Biome::Polar
+            } else {
+                Biome::Boreal
+            }
+        }
+        TerrainType::Forest => {
+            if temperature > 0.66 && moisture > 0.56 {
+                Biome::Tropical
+            } else if temperature < 0.32 {
+                Biome::Boreal
+            } else {
+                Biome::Temperate
+            }
+        }
+        TerrainType::Plains | TerrainType::Hills => {
+            if coastal {
+                Biome::Coast
+            } else if temperature > 0.68 && moisture > 0.5 {
+                Biome::Tropical
+            } else if temperature < 0.28 {
+                Biome::Boreal
+            } else {
+                Biome::Temperate
+            }
+        }
+    }
+}
+
 fn random_unit(rng: &mut SeededRng) -> f32 {
     rng.next_u32() as f32 / (u32::MAX as f32)
 }
@@ -724,9 +836,26 @@ mod tests {
             count_terrain_in_region(&world, 58..72, 24..33, TerrainType::Mountain)
                 + count_terrain_in_region(&world, 58..72, 24..33, TerrainType::Hills);
         let sahara_deserts = count_terrain_in_region(&world, 54..69, 28..36, TerrainType::Desert);
+        let arctic_tundra = count_terrain_in_region(&world, 50..95, 0..12, TerrainType::Tundra);
 
         assert!(himalaya_rugged >= 4);
         assert!(sahara_deserts >= 12);
+        assert!(arctic_tundra >= 16);
+    }
+
+    #[test]
+    fn earth_world_populates_tile_metadata() {
+        let world = World::generate(WorldConfig::new(120, 80, 13).with_preset(WorldPreset::Earth));
+        let tile = world
+            .map
+            .get(crate::ids::TilePosition::new(60, 20))
+            .unwrap();
+
+        assert!(
+            tile.metadata.elevation > 0
+                || tile.metadata.moisture > 0
+                || tile.metadata.temperature > 0
+        );
     }
 
     fn count_land_in_region(

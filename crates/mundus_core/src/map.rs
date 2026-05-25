@@ -87,7 +87,14 @@ impl Map {
     pub fn set_terrain(&mut self, position: TilePosition, terrain: TerrainType) {
         if self.in_bounds(position) {
             let index = self.index(position);
-            self.tiles[index] = Tile::new(terrain);
+            self.tiles[index].terrain = terrain;
+        }
+    }
+
+    pub fn set_tile(&mut self, position: TilePosition, tile: Tile) {
+        if self.in_bounds(position) {
+            let index = self.index(position);
+            self.tiles[index] = tile;
         }
     }
 

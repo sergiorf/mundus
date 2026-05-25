@@ -17,7 +17,7 @@ pub fn move_unit(
     let tile = map
         .get(to)
         .ok_or(GameError::InvalidAction("target tile is missing"))?;
-    if !tile.terrain.is_passable() {
+    if !tile.is_passable() {
         return Err(GameError::InvalidAction("target tile is not passable"));
     }
 

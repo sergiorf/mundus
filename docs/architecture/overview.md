@@ -36,6 +36,11 @@ Because `mundus_core` is isolated, future clients can wrap the same logic:
 
 Those layers should translate user intent into `PlayerAction` values and render `GameState` plus `TurnReport` output. They should not own gameplay rules.
 
+## Active architecture notes
+
+- [Earth World Pipeline](./earth_world_pipeline.md)
+- [Strategic Simulation Architecture](./strategic_simulation.md)
+
 ## Save/load and replay support
 
 The core types derive `serde` traits so future save/load can serialize `GameState`, `GameConfig`, and action logs. Two low-risk extensions follow naturally:
