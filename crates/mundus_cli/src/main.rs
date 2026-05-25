@@ -6,19 +6,21 @@ use mundus_core::{
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-const WORLD_MAP_WIDTH: usize = 120;
-const WORLD_MAP_HEIGHT: usize = 80;
-const BASE_TILE_SIZE: f32 = 48.0;
+const WORLD_MAP_WIDTH: usize = 360;
+const WORLD_MAP_HEIGHT: usize = 180;
 const MIN_ZOOM: f32 = 0.18;
 const MAX_ZOOM: f32 = 9.0;
 const ZOOM_STEP: f32 = 0.2;
-const EARTH_LOD0_MANIFEST: &str = "assets/earth/render/lod0/manifest.toml";
+const EARTH_RENDER_ROOT: &str = "assets/earth/render";
+const VIEWER_BACKGROUND: Color = Color::new(0.08, 0.11, 0.17, 1.0);
+const MAP_LIGHTEN_OVERLAY: Color = Color::new(1.0, 0.98, 0.92, 0.18);
 
 fn window_conf() -> Conf {
     Conf {
         window_title: "Mundus Terrain Viewer".to_string(),
         window_width: 1440,
         window_height: 900,
+        window_resizable: true,
         high_dpi: true,
         ..Default::default()
     }
@@ -87,7 +89,7 @@ struct TerrainViewer {
     world: World,
     seed: u64,
     camera: ViewerCamera,
-    earth_lod0: Option<EarthLod0Layer>,
+    earth_layers: Vec<EarthRenderLayer>,
 }
 
 struct ViewerCamera {
@@ -96,7 +98,9 @@ struct ViewerCamera {
     drag_last_mouse: Option<Vec2>,
 }
 
-struct EarthLod0Layer {
+struct EarthRenderLayer {
+    lod: u8,
+    tile_size_px: u32,
     tiles_x: u32,
     tiles_y: u32,
     tiles: Vec<EarthTextureTile>,
@@ -118,7 +122,7 @@ impl TerrainViewer {
                 zoom: 1.0,
                 drag_last_mouse: None,
             },
-            earth_lod0: load_earth_lod0().await,
+            earth_layers: load_earth_render_layers().await,
         }
     }
 
@@ -183,34 +187,36 @@ impl TerrainViewer {
     }
 
     fn draw(&self) {
-        clear_background(Color::from_rgba(9, 14, 24, 255));
+        clear_background(VIEWER_BACKGROUND);
 
         let tile_size = self.tile_size();
         let hovered = self.hovered_tile();
 
         self.draw_earth_background();
 
-        for y in 0..self.world.map.height {
-            for x in 0..self.world.map.width {
-                let position = TilePosition::new(x, y);
-                let screen = self.tile_to_screen(position);
+        if tile_size >= 8.0 {
+            for y in 0..self.world.map.height {
+                for x in 0..self.world.map.width {
+                    let position = TilePosition::new(x, y);
+                    let screen = self.tile_to_screen(position);
 
-                if screen.x > screen_width()
-                    || screen.y > screen_height()
-                    || screen.x + tile_size < 0.0
-                    || screen.y + tile_size < 0.0
-                {
-                    continue;
+                    if screen.x > screen_width()
+                        || screen.y > screen_height()
+                        || screen.x + tile_size < 0.0
+                        || screen.y + tile_size < 0.0
+                    {
+                        continue;
+                    }
+
+                    draw_rectangle_lines(
+                        screen.x,
+                        screen.y,
+                        tile_size,
+                        tile_size,
+                        1.0,
+                        Color::from_rgba(255, 255, 255, 18),
+                    );
                 }
-
-                draw_rectangle_lines(
-                    screen.x,
-                    screen.y,
-                    tile_size,
-                    tile_size,
-                    1.0,
-                    Color::from_rgba(255, 255, 255, 24),
-                );
             }
         }
 
@@ -230,7 +236,7 @@ impl TerrainViewer {
     }
 
     fn draw_earth_background(&self) {
-        let Some(layer) = &self.earth_lod0 else {
+        let Some(layer) = self.active_earth_layer() else {
             return;
         };
 
@@ -241,10 +247,7 @@ impl TerrainViewer {
         for tile in &layer.tiles {
             let world_x = tile.x as f32 * tile_world_width;
             let world_y = tile.y as f32 * tile_world_height;
-            let screen = vec2(
-                (world_x - self.camera.tiles.x) * tile_size,
-                (world_y - self.camera.tiles.y) * tile_size,
-            );
+            let screen = self.world_to_screen(vec2(world_x, world_y));
             let dest_size = vec2(tile_world_width * tile_size, tile_world_height * tile_size);
 
             if screen.x > screen_width()
@@ -266,6 +269,17 @@ impl TerrainViewer {
                 },
             );
         }
+
+        let offset = self.viewport_offset(tile_size);
+        let map_width = self.world.map.width as f32 * tile_size;
+        let map_height = self.world.map.height as f32 * tile_size;
+        draw_rectangle(
+            offset.x,
+            offset.y,
+            map_width,
+            map_height,
+            MAP_LIGHTEN_OVERLAY,
+        );
     }
 
     fn draw_hud(&self, hovered: Option<TilePosition>) {
@@ -280,8 +294,12 @@ impl TerrainViewer {
         );
         draw_text(
             &format!(
-                "preset=earth  seed={}  zoom={:.2}  map={}x{}  --cli: text mode",
-                self.seed, self.camera.zoom, self.world.map.width, self.world.map.height
+                "preset=earth  seed={}  zoom={:.2}  map={}x{}  render={}  --cli: text mode",
+                self.seed,
+                self.camera.zoom,
+                self.world.map.width,
+                self.world.map.height,
+                self.active_earth_layer_name(),
             ),
             28.0,
             100.0,
@@ -317,22 +335,59 @@ impl TerrainViewer {
     }
 
     fn tile_size(&self) -> f32 {
-        BASE_TILE_SIZE * self.camera.zoom
+        self.fitted_tile_size() * self.camera.zoom
     }
 
-    fn tile_to_screen(&self, position: TilePosition) -> Vec2 {
+    fn fitted_tile_size(&self) -> f32 {
+        let fit_x = screen_width() / self.world.map.width as f32;
+        let fit_y = screen_height() / self.world.map.height as f32;
+        fit_x.min(fit_y).max(0.0001)
+    }
+
+    fn world_to_screen(&self, world: Vec2) -> Vec2 {
         let tile_size = self.tile_size();
+        let offset = self.viewport_offset(tile_size);
         vec2(
-            (position.x as f32 - self.camera.tiles.x) * tile_size,
-            (position.y as f32 - self.camera.tiles.y) * tile_size,
+            offset.x + (world.x - self.camera.tiles.x) * tile_size,
+            offset.y + (world.y - self.camera.tiles.y) * tile_size,
         )
     }
 
-    fn screen_to_world_tiles(&self, screen: Vec2, zoom: f32) -> Vec2 {
-        let tile_size = BASE_TILE_SIZE * zoom;
+    fn viewport_offset(&self, tile_size: f32) -> Vec2 {
+        let map_width = self.world.map.width as f32 * tile_size;
+        let map_height = self.world.map.height as f32 * tile_size;
         vec2(
-            self.camera.tiles.x + screen.x / tile_size,
-            self.camera.tiles.y + screen.y / tile_size,
+            ((screen_width() - map_width) * 0.5).max(0.0),
+            ((screen_height() - map_height) * 0.5).max(0.0),
+        )
+    }
+
+    fn active_earth_layer(&self) -> Option<&EarthRenderLayer> {
+        let target_pixels_per_world_tile = self.tile_size();
+        self.earth_layers
+            .iter()
+            .find(|layer| {
+                layer.pixels_per_world_tile(self.world.map.width) >= target_pixels_per_world_tile
+            })
+            .or_else(|| self.earth_layers.last())
+    }
+
+    fn active_earth_layer_name(&self) -> String {
+        self.active_earth_layer()
+            .map(|layer| format!("lod{}", layer.lod))
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    fn tile_to_screen(&self, position: TilePosition) -> Vec2 {
+        self.world_to_screen(vec2(position.x as f32, position.y as f32))
+    }
+
+    fn screen_to_world_tiles(&self, screen: Vec2, zoom: f32) -> Vec2 {
+        let tile_size = self.fitted_tile_size() * zoom;
+        let offset = self.viewport_offset(tile_size);
+        vec2(
+            self.camera.tiles.x + (screen.x - offset.x) / tile_size,
+            self.camera.tiles.y + (screen.y - offset.y) / tile_size,
         )
     }
 
@@ -358,15 +413,56 @@ impl TerrainViewer {
     }
 }
 
+impl EarthRenderLayer {
+    fn atlas_width_px(&self) -> f32 {
+        self.tiles_x as f32 * self.tile_size_px as f32
+    }
+
+    fn pixels_per_world_tile(&self, world_width: usize) -> f32 {
+        self.atlas_width_px() / world_width as f32
+    }
+}
+
 fn build_world(seed: u64) -> World {
     World::generate(
         WorldConfig::new(WORLD_MAP_WIDTH, WORLD_MAP_HEIGHT, seed).with_preset(WorldPreset::Earth),
     )
 }
 
-async fn load_earth_lod0() -> Option<EarthLod0Layer> {
-    let manifest_path = Path::new(EARTH_LOD0_MANIFEST);
+async fn load_earth_render_layers() -> Vec<EarthRenderLayer> {
+    let render_root = Path::new(EARTH_RENDER_ROOT);
+    let Ok(entries) = std::fs::read_dir(render_root) else {
+        return Vec::new();
+    };
+
+    let mut lod_dirs = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if !path.is_dir() {
+                return None;
+            }
+
+            let name = path.file_name()?.to_str()?;
+            let lod = name.strip_prefix("lod")?.parse::<u8>().ok()?;
+            Some((lod, path))
+        })
+        .collect::<Vec<_>>();
+    lod_dirs.sort_by_key(|(lod, _)| *lod);
+
+    let mut layers = Vec::new();
+    for (lod, dir) in lod_dirs {
+        if let Some(layer) = load_earth_render_layer(lod, &dir).await {
+            layers.push(layer);
+        }
+    }
+
+    layers
+}
+
+async fn load_earth_render_layer(lod: u8, dir: &Path) -> Option<EarthRenderLayer> {
+    let manifest_path = dir.join("manifest.toml");
     let manifest = std::fs::read_to_string(manifest_path).ok()?;
+    let mut tile_size_px = None;
     let mut tiles_x = None;
     let mut tiles_y = None;
     let mut pending_x = None;
@@ -375,7 +471,9 @@ async fn load_earth_lod0() -> Option<EarthLod0Layer> {
 
     for line in manifest.lines() {
         let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix("tiles_x = ") {
+        if let Some(value) = trimmed.strip_prefix("tile_size = ") {
+            tile_size_px = value.parse::<u32>().ok();
+        } else if let Some(value) = trimmed.strip_prefix("tiles_x = ") {
             tiles_x = value.parse::<u32>().ok();
         } else if let Some(value) = trimmed.strip_prefix("tiles_y = ") {
             tiles_y = value.parse::<u32>().ok();
@@ -385,10 +483,9 @@ async fn load_earth_lod0() -> Option<EarthLod0Layer> {
             pending_y = value.parse::<u32>().ok();
         } else if let Some(value) = trimmed.strip_prefix("path = ") {
             let path = value.trim_matches('"');
-            let base_dir = manifest_path.parent()?;
-            let full_path: PathBuf = base_dir.join(path);
+            let full_path: PathBuf = dir.join(path);
             let texture = load_texture(full_path.to_str()?).await.ok()?;
-            texture.set_filter(FilterMode::Linear);
+            texture.set_filter(FilterMode::Nearest);
             tiles.push(EarthTextureTile {
                 x: pending_x.take()?,
                 y: pending_y.take()?,
@@ -397,7 +494,9 @@ async fn load_earth_lod0() -> Option<EarthLod0Layer> {
         }
     }
 
-    Some(EarthLod0Layer {
+    Some(EarthRenderLayer {
+        lod,
+        tile_size_px: tile_size_px?,
         tiles_x: tiles_x?,
         tiles_y: tiles_y?,
         tiles,

@@ -70,9 +70,9 @@ This is still a scaffold. It does not rasterize polygons or cut image tiles yet.
 
 - extracts `ne_110m_land.*` from the Natural Earth zip
 - rasterizes a `360x180` Earth landmask into `assets/earth/sim/earth_360x180_landmask.toml`
-- resizes Blue Marble into a `512x256` LOD0 atlas
-- writes two `256x256` LOD0 tiles and a tile manifest under
-  `assets/earth/render/lod0/`
+- resizes Blue Marble into a small render pyramid
+- writes `lod0` through `lod3` tile sets and manifests under
+  `assets/earth/render/`
 
 ## What you need to download now
 

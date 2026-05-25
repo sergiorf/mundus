@@ -12,6 +12,14 @@ use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 use zip::ZipArchive;
 
+const RENDER_TILE_SIZE: u32 = 256;
+const EARTH_RENDER_LODS: &[(u8, u32, u32)] = &[
+    (0, 512, 256),
+    (1, 1024, 512),
+    (2, 2048, 1024),
+    (3, 3072, 1536),
+];
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("earth_pipeline: {error}");
@@ -93,11 +101,13 @@ fn scaffold_first_milestone() -> Result<(), Box<dyn Error>> {
 
     let target_dir = repo_root.join("assets/earth/raw/first_milestone");
     fs::create_dir_all(&target_dir)?;
-    fs::create_dir_all(repo_root.join("assets/earth/render/lod0"))?;
+    for (lod, _, _) in EARTH_RENDER_LODS {
+        fs::create_dir_all(repo_root.join(format!("assets/earth/render/lod{lod}")))?;
+    }
     fs::create_dir_all(repo_root.join("assets/earth/sim"))?;
 
     let sim_output = repo_root.join("assets/earth/sim/earth_360x180_landmask.toml");
-    let render_output = repo_root.join("assets/earth/render/lod0");
+    let render_output = repo_root.join("assets/earth/render");
     let plan_path = target_dir.join("targets.toml");
 
     let natural_earth_lines = natural_earth_files
@@ -122,7 +132,7 @@ fn scaffold_first_milestone() -> Result<(), Box<dyn Error>> {
          sim_landmask = \"{sim_output}\"\n\
          render_lod0_dir = \"{render_output}\"\n\n\
          [notes]\n\
-         next_step = \"Implement a bake command that rasterizes Natural Earth land polygons into the simulation Earth mask and cuts Blue Marble into LOD0 color tiles.\"\n",
+         next_step = \"Implement a bake command that rasterizes Natural Earth land polygons into the simulation Earth mask and cuts Blue Marble into multiple render LODs.\"\n",
         goal = manifest.first_milestone.goal,
         natural_earth = natural_earth_lines,
         blue_marble = blue_marble_lines,
@@ -160,9 +170,9 @@ fn bake_first_milestone() -> Result<(), Box<dyn Error>> {
     let blue_marble_png = single_required_file(&repo_root, blue_marble)?;
 
     let sim_output = repo_root.join("assets/earth/sim/earth_360x180_landmask.toml");
-    let lod0_dir = repo_root.join("assets/earth/render/lod0");
+    let render_dir = repo_root.join("assets/earth/render");
     fs::create_dir_all(sim_output.parent().ok_or("missing sim output parent")?)?;
-    fs::create_dir_all(&lod0_dir)?;
+    fs::create_dir_all(&render_dir)?;
 
     let polygons = load_land_polygons_from_zip(&natural_earth_zip)?;
     write_landmask_toml(
@@ -173,11 +183,16 @@ fn bake_first_milestone() -> Result<(), Box<dyn Error>> {
         360,
         180,
     )?;
-    write_lod0_tiles(&blue_marble_png, &repo_root, &lod0_dir)?;
+    write_render_lods(&blue_marble_png, &repo_root, &render_dir)?;
 
     println!("Baked first milestone outputs:");
     println!("  {}", relative_to_repo(&repo_root, &sim_output).display());
-    println!("  {}", relative_to_repo(&repo_root, &lod0_dir).display());
+    for (lod, _, _) in EARTH_RENDER_LODS {
+        println!(
+            "  {}",
+            relative_to_repo(&repo_root, &render_dir.join(format!("lod{lod}"))).display()
+        );
+    }
 
     Ok(())
 }
@@ -324,39 +339,82 @@ fn write_landmask_toml(
     Ok(())
 }
 
-fn write_lod0_tiles(
+fn write_render_lods(
     source_png: &Path,
     repo_root: &Path,
-    lod0_dir: &Path,
+    render_root: &Path,
 ) -> Result<(), Box<dyn Error>> {
     let image = image::open(source_png)?;
-    let resized = image.resize_exact(512, 256, FilterType::CatmullRom);
-
-    for tile_x in 0..2u32 {
-        let tile = resized.crop_imm(tile_x * 256, 0, 256, 256);
-        let tile_path = lod0_dir.join(format!("tile_{tile_x}_0.png"));
-        tile.save(tile_path)?;
+    for (lod, width, height) in EARTH_RENDER_LODS {
+        write_render_lod(
+            &image,
+            source_png,
+            repo_root,
+            render_root,
+            *lod,
+            *width,
+            *height,
+        )?;
     }
 
-    let manifest_path = lod0_dir.join("manifest.toml");
+    Ok(())
+}
+
+fn write_render_lod(
+    image: &image::DynamicImage,
+    source_png: &Path,
+    repo_root: &Path,
+    render_root: &Path,
+    lod: u8,
+    width: u32,
+    height: u32,
+) -> Result<(), Box<dyn Error>> {
+    let lod_dir = render_root.join(format!("lod{lod}"));
+    fs::create_dir_all(&lod_dir)?;
+
+    let resized = image.resize_exact(width, height, FilterType::CatmullRom);
+    let tiles_x = width / RENDER_TILE_SIZE;
+    let tiles_y = height / RENDER_TILE_SIZE;
+    let mut manifest_tiles = String::new();
+
+    for tile_y in 0..tiles_y {
+        for tile_x in 0..tiles_x {
+            let tile = resized.crop_imm(
+                tile_x * RENDER_TILE_SIZE,
+                tile_y * RENDER_TILE_SIZE,
+                RENDER_TILE_SIZE,
+                RENDER_TILE_SIZE,
+            );
+            let tile_name = format!("tile_{tile_x}_{tile_y}.png");
+            tile.save(lod_dir.join(&tile_name))?;
+            manifest_tiles.push_str(&format!(
+                "[[tiles]]\n\
+                 x = {tile_x}\n\
+                 y = {tile_y}\n\
+                 path = \"{tile_name}\"\n\n"
+            ));
+        }
+    }
+
+    let manifest_path = lod_dir.join("manifest.toml");
     let content = format!(
         "version = 1\n\
-         tile_size = 256\n\
-         tiles_x = 2\n\
-         tiles_y = 1\n\
-         source = \"{}\"\n\
-         source_dimensions = [{}, {}]\n\n\
-         [[tiles]]\n\
-         x = 0\n\
-         y = 0\n\
-         path = \"tile_0_0.png\"\n\n\
-         [[tiles]]\n\
-         x = 1\n\
-         y = 0\n\
-         path = \"tile_1_0.png\"\n",
-        relative_to_repo(repo_root, source_png).display(),
-        image.width(),
-        image.height()
+         tile_size = {tile_size}\n\
+         tiles_x = {tiles_x}\n\
+         tiles_y = {tiles_y}\n\
+         source = \"{source}\"\n\
+         source_dimensions = [{source_width}, {source_height}]\n\
+         atlas_dimensions = [{width}, {height}]\n\n\
+         {manifest_tiles}",
+        tile_size = RENDER_TILE_SIZE,
+        tiles_x = tiles_x,
+        tiles_y = tiles_y,
+        source = relative_to_repo(repo_root, source_png).display(),
+        source_width = image.width(),
+        source_height = image.height(),
+        width = width,
+        height = height,
+        manifest_tiles = manifest_tiles
     );
     fs::write(manifest_path, content)?;
 
